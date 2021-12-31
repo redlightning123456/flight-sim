@@ -1,89 +1,228 @@
 ﻿using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
-
+using CoordinateSharp;
+using UnityEngine.Networking;
 public class Movement : MonoBehaviour
 {
-    class Waypoint
+    List<DronePath> dronePaths = new List<DronePath>();
+    int dronePathIndex = 0;
+    int destIndex = 0;
+    EndpointBehavior whenAtEndpoint = EndpointBehavior.Cycle;
+    public GameObject waypointMarker;
+    PathDisplayer pathDisplayer;
+    Map map;
+    float speed = 0;
+    bool finishedLoadingPaths = false;
+
+    enum EndpointBehavior
     {
-        public Vector3 position;
-        public float speed;
+        Cycle,
+        Halt
+    }
 
-        //slightly modified mercatorEncode from https://gist.github.com/leebyron/997450
-        static double[] mercatorEncode(double lon, double lat, double lonOrigin)
+    public struct DronePath
+    {
+        public int number;
+        public List<Waypoint> waypoints;
+
+        public DronePath(int number, List<Waypoint> waypoints)
         {
-            double[] p = new double[2];
-            p[0] = (lon - lonOrigin) / (2 * Mathf.PI);
-            while (p[0] < 0) p[0]++;
-            p[1] = 1 - (Mathf.Log(Mathf.Tan((float)(Mathf.PI / 4 + lat / 2))) * 0.31830988618 + 1) / 2;
-            return p;
+            this.number = number;
+            this.waypoints = waypoints;
         }
 
-        static double[] LonLatTo2DCartesianCoordinates(double lon, double lat)
+        public Vector3 globalAnchor()
         {
-            return mercatorEncode(lon * Mathf.PI / 180, lat * Mathf.PI / 180, -Mathf.PI);
+            return new Vector3(waypoints[0].position.x, 0, waypoints[0].position.z);
         }
-        
-        static Vector3 positionFormatTo3DCartesianCoordinates(Vector3 position)
+    };
+
+    public class Waypoint
+    {
+        public Vector3 position { get; private set; }
+	public double lat { get; private set; }
+	public double lon { get; private set; }
+	public double height { get; private set; }
+        public double speed { get; private set; }
+
+
+        public Waypoint(double lat, double lon, double height, double speed)
         {
-            double[] surfaceCoordinates = LonLatTo2DCartesianCoordinates(position[0], position[1]);
-            return new Vector3((float)surfaceCoordinates[0], position[2], (float)surfaceCoordinates[1]);
-        }
-        
-        public Waypoint(Vector3 position, float speed)
-        {
-            this.position = position;
+            this.lat = lat;
+	    this.lon = lon;
+	    Coordinate coord = new Coordinate(lat, lon, new EagerLoad(EagerLoadType.UTM_MGRS));
+	    this.position = new Vector3((float)(coord.UTM.Easting), (float)(height), (float)(coord.UTM.Northing));
+	    this.height = height;
             this.speed = speed;
         }
     };
 
-    ////for real lon/lat/height sample
-    //List<Waypoint> waypoints = new List<Waypoint>()
-    //{
-    //    new Waypoint(new Vector3(32.88271705f, 35.03533566f, 2.0f), 20),
-    //    new Waypoint(new Vector3(32.97832839f, 35.14022953f, 0.0f), 20),
-    //    new Waypoint(new Vector3(32.56478879f, 35.24022953f, 2.0f), 20),
-    //    new Waypoint(new Vector3(32.46478879f, 35.03533566f, 0.0f), 20),
-    //    new Waypoint(new Vector3(32.36478879f, 35.05458656f, 2.0f), 0)
-    //};
-
-    //for pilot test data
-    List<Waypoint> waypoints = new List<Waypoint>()
+    IEnumerator loadDrones()
     {
-        new Waypoint(new Vector3(15.2f, 97.4f, 121.8f), 20),
-        new Waypoint(new Vector3(-65.6f, 115.8f, 66.8f), 20),
-        new Waypoint(new Vector3(85.2f, 45.2f, -58.6f), 20),
-        new Waypoint(new Vector3(-85.7f, 53.8f, -72.9f), 0)
-    };
+        var www = UnityWebRequest.Get("http://localhost:8080/waypoints.xlsx");
+        var sendOperation = www.SendWebRequest();
 
-    int nextWaypointIndex = 0;
+        yield return sendOperation;
 
-    void Start()
-    {
-        if (waypoints.Count > 0)
+        if (www.result != UnityWebRequest.Result.Success)
         {
-            this.transform.position = waypoints[nextWaypointIndex].position;
-            nextWaypointIndex += 1;
+            Debug.Log("Error when trying to fetch drone paths: " + www.error);
+            Debug.Log("Response from server: " + www.responseCode);
+            yield break;
+        }
+
+
+        using (var stream = new System.IO.MemoryStream(www.downloadHandler.data))
+        {
+            using (var reader = ExcelDataReader.ExcelReaderFactory.CreateReader(stream))
+            {
+                do
+                {
+                    if (reader.Name.StartsWith("d"))
+                    {
+                        int droneNumber;
+                        if (int.TryParse(reader.Name.Substring(1), out droneNumber))
+                        {
+                            dronePaths.Add(new DronePath(droneNumber, new List<Waypoint>()));
+                            reader.Read(); //start from the second row to ignore ["lat", "lon", "height", "speed"] head row
+                            while (reader.Read())
+                            {
+                                float lat = (float)reader.GetDouble(0);
+                                float lon = (float)reader.GetDouble(1);
+                                float height = (float)reader.GetDouble(2);
+                                float speed = (float)reader.GetDouble(3);
+                                dronePaths[dronePaths.Count - 1].waypoints.Add(new Waypoint(lat, lon, height, speed));
+                            }
+                        }
+                    }
+                } while (reader.NextResult());
+            }
+        }
+        dronePaths.Sort((a, b) => a.number.CompareTo(b.number));
+        finishedLoadingPaths = true;
+    }
+
+    void advanceWaypoint()
+    {
+        destIndex += 1;
+        if (destIndex >= dronePaths[dronePathIndex].waypoints.Count)
+        {
+            destIndex = 0;
+            dronePathIndex += 1;
+            if (dronePathIndex == dronePaths.Count)
+            {
+                dronePathIndex = 0;
+            }
+            pathDisplayer.updatePath(this.dronePaths[dronePathIndex]);
+        }
+    }
+
+    private void OnGUI()
+    {
+        GUIStyle style = new GUIStyle();
+        style.normal.textColor = Color.black;
+        style.fontSize = 16;
+
+        if (finishedLoadingPaths)
+        {
+            Vector3 coords;
+            if (dronePathIndex < dronePaths.Count)
+            {
+                coords = transform.position + dronePaths[dronePathIndex].globalAnchor();
+            }
+            else
+            {
+                coords = transform.position + dronePaths[dronePaths.Count - 1].globalAnchor();
+            }
+
+            GUI.Label(new Rect(100, 100, 600, 100),
+                "Drone #: " + (dronePathIndex + 1).ToString() + "\n" +
+                "Waypoint #: " + (destIndex - 1 + 1).ToString() + "\n" +
+                "Position (UTM northing/easting/height): " + coords.x + ", " + coords.z + ", " + coords.y,
+                style
+                );
         }
         else
         {
-            Debug.LogError("No waypoints were specified for the drone. It has nowhere to go.");
+            GUI.Label(new Rect(100, 100, 600, 100),
+                "Drone #: " + "N\\A" + "\n" +
+                "Waypoint #: " + "N\\A" + "\n" +
+                "Position (UTM northing/easting/height): " + "N\\A" + ", " + "N\\A" + ", " + "N\\A",
+                style
+                );
+        }
+    }
+
+    void moveTo(Vector3 point)
+    {
+        this.transform.position = point;
+
+        //var coord = UniversalTransverseMercator.ConvertUTMtoLatLong(new UniversalTransverseMercator("S", 36, point.x, point.z));
+        //map.updatePos(coord.Latitude.ToDouble(), coord.Longitude.ToDouble());
+    }
+
+    IEnumerator Start()
+    {
+        pathDisplayer = new PathDisplayer(waypointMarker);
+        map = new Map();
+        yield return StartCoroutine(loadDrones());
+        StartCoroutine(map.update(this.dronePaths[0].waypoints[0].lat, this.dronePaths[0].waypoints[0].lon, this.dronePaths[0].globalAnchor()));
+        pathDisplayer.updatePath(this.dronePaths[0]);
+        this.moveTo(dronePaths[0].waypoints[0].position - dronePaths[dronePathIndex].globalAnchor());
+        this.speed = (float)(dronePaths[dronePathIndex].waypoints[destIndex].speed);
+        advanceWaypoint();
+        this.lookAtDest();
+    }
+
+    void lookAtDest()
+    {
+        Vector3 vectorToDest = dronePaths[dronePathIndex].waypoints[destIndex].position - dronePaths[dronePathIndex].globalAnchor() - this.transform.position;
+        if (vectorToDest != Vector3.zero)
+            this.transform.rotation = Quaternion.LookRotation(vectorToDest);
+    }
+
+    void moveTowardDest()
+    {
+        Vector3 vectorToDest = dronePaths[dronePathIndex].waypoints[destIndex].position - dronePaths[dronePathIndex].globalAnchor() - this.transform.position;
+        if (vectorToDest != Vector3.zero)
+            this.transform.rotation = Quaternion.Slerp(this.transform.rotation, Quaternion.LookRotation(vectorToDest), Time.deltaTime * this.speed / 10.0f);
+
+        this.moveTo(this.transform.position + Time.deltaTime * this.speed * (this.transform.rotation * Vector3.forward));
+
+        if (Vector3.Distance(transform.position, dronePaths[dronePathIndex].waypoints[destIndex].position - dronePaths[dronePathIndex].globalAnchor()) <= Time.maximumDeltaTime * this.speed)
+        {
+            this.speed = (float)(dronePaths[dronePathIndex].waypoints[destIndex].speed);
+            advanceWaypoint();
+            if (destIndex == 0)
+            {
+                this.moveTo(dronePaths[dronePathIndex].waypoints[0].position - dronePaths[dronePathIndex].globalAnchor());
+                this.lookAtDest();
+            }
         }
     }
 
     void Update()
     {
-        if (nextWaypointIndex < waypoints.Count)
+        if (finishedLoadingPaths)
         {
-            this.transform.rotation = Quaternion.LookRotation(waypoints[nextWaypointIndex].position -  this.transform.position);
-
-            this.transform.position += Time.deltaTime * waypoints[nextWaypointIndex - 1].speed * (this.transform.rotation * Vector3.forward);
-            
-            if (Vector3.Distance(transform.position, waypoints[nextWaypointIndex].position) <= Time.maximumDeltaTime * waypoints[nextWaypointIndex - 1].speed)
+            switch (this.whenAtEndpoint)
             {
-                nextWaypointIndex += 1;
+                case EndpointBehavior.Cycle:
+                    if (dronePathIndex >= dronePaths.Count)
+                    {
+                        dronePathIndex = 0;
+                        destIndex = 0;
+                    }
+                    this.moveTowardDest();
+                    break;
+                case EndpointBehavior.Halt:
+                    if (dronePathIndex < dronePaths.Count)
+                    {
+                        this.moveTowardDest();
+                    }
+                    break;
             }
-            
         }
     }
 }

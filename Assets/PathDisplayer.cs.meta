@@ -1,0 +1,13 @@
+fileFormatVersion: 2
+guid: 36a4d5b34b2f6884eb3177c8da382b9b
+MonoImporter:
+  externalObjects: {}
+  serializedVersion: 2
+  defaultReferences:
+  - waypointMarker: {fileID: 463502977335754280, guid: 7a017c8fef7119944897596fc40f80f0,
+      type: 3}
+  executionOrder: 0
+  icon: {instanceID: 0}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
